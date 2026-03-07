@@ -1,0 +1,945 @@
+diff --git a/lmms_eval/__main__.py b/lmms_eval/__main__.py
+index fb2b3743..57523564 100755
+--- a/lmms_eval/__main__.py
++++ b/lmms_eval/__main__.py
+@@ -267,6 +267,12 @@ def parse_eval_args() -> argparse.Namespace:
+             "E.g, `--seed 42` sets all four seeds to 42."
+         ),
+     )
++    parser.add_argument(
++        "--data_files",
++        type=str,
++        default=None,
++        help="A comma-separated list of data files to use for evaluation. If not provided, the default data files for each task will be used.",
++    )
+     parser.add_argument(
+         "--trust_remote_code",
+         action="store_true",
+@@ -388,7 +394,7 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
+ 
+     if args.include_path is not None:
+         eval_logger.info(f"Including path: {args.include_path}")
+-    task_manager = TaskManager(args.verbosity, include_path=args.include_path, model_name=args.model)
++    task_manager = TaskManager(args.verbosity, include_path=args.include_path, model_name=args.model, data_files=args.data_files)
+ 
+     # update the evaluation tracker args with the output path and the HF token
+     if args.output_path:
+@@ -525,7 +531,14 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
+ 
+         batch_sizes = ",".join(map(str, results["config"]["batch_sizes"]))
+ 
+-        evaluation_tracker.save_results_aggregated(results=results, samples=samples if args.log_samples else None, datetime_str=datetime_str)
++        data_name = None
++        if args.data_files is not None:
++            data_files = json.loads(args.data_files)
++            file_path = next(iter(data_files.values()))
++            data_name = os.path.basename(file_path)
++            data_name =os.path.splitext(data_name)[0]
++
++        evaluation_tracker.save_results_aggregated(results=results, samples=samples if args.log_samples else None, datetime_str=datetime_str, data_name=data_name)
+ 
+         if args.log_samples:
+             for task_name, config in results["configs"].items():
+diff --git a/lmms_eval/api/task.py b/lmms_eval/api/task.py
+index ed9aa757..8b0e1068 100755
+--- a/lmms_eval/api/task.py
++++ b/lmms_eval/api/task.py
+@@ -1048,6 +1048,11 @@ class ConfigurableTask(Task):
+             # using local task in offline environment, need to process the online dataset into local format via
+             # `ds = load_datasets("lmms-lab/MMMU")`
+             self.dataset = datasets.load_from_disk(dataset_path=self.DATASET_PATH)
++        elif dataset_kwargs is not None and "custom_load" in dataset_kwargs and dataset_kwargs["custom_load"]:
++            self.dataset = datasets.load_dataset(
++                path=self.DATASET_PATH,
++                data_files=dataset_kwargs['data_files']
++            )
+         else:
+             self.dataset = datasets.load_dataset(
+                 path=self.DATASET_PATH,
+diff --git a/lmms_eval/loggers/evaluation_tracker.py b/lmms_eval/loggers/evaluation_tracker.py
+index 65936cdf..bfdcd0d8 100644
+--- a/lmms_eval/loggers/evaluation_tracker.py
++++ b/lmms_eval/loggers/evaluation_tracker.py
+@@ -172,6 +172,7 @@ class EvaluationTracker:
+         results: dict,
+         samples: dict,
+         datetime_str: str,
++        data_name: str = None,
+     ) -> None:
+         """
+         Saves the aggregated results and samples to the output path and pushes them to the Hugging Face hub if requested.
+@@ -209,6 +210,8 @@ class EvaluationTracker:
+                 path.mkdir(parents=True, exist_ok=True)
+ 
+                 self.date_id = datetime_str.replace(":", "-")
++                if data_name:
++                    self.date_id = f"{data_name}+{self.date_id}"
+                 file_results_aggregated = path.joinpath(f"{self.date_id}_results.json")
+                 file_results_aggregated.open("w", encoding="utf-8").write(dumped)
+ 
+diff --git a/lmms_eval/models/chat/qwen2_5_vl.py b/lmms_eval/models/chat/qwen2_5_vl.py
+index 97c675d4..c78abca1 100644
+--- a/lmms_eval/models/chat/qwen2_5_vl.py
++++ b/lmms_eval/models/chat/qwen2_5_vl.py
+@@ -16,10 +16,10 @@ from lmms_eval.models.model_utils.reasoning_model_utils import (
+ from lmms_eval.models.simple.qwen2_5_vl import Qwen2_5_VL as Qwen2_5_VLSimple
+ from lmms_eval.protocol import ChatMessages
+ 
+-try:
+-    from qwen_vl_utils import process_vision_info
+-except ImportError:
+-    eval_logger.warning("Failed to import qwen_vl_utils; Please install it via `pip install qwen-vl-utils`")
++
++from qwen_vl_utils import process_vision_info
++from ..model_utils.qwen2_5_vl_keyframe_vision_process import process_vision_info_keyframe
++
+ 
+ 
+ @register_model("qwen2_5_vl_chat")
+@@ -67,7 +67,12 @@ class Qwen2_5_VL(Qwen2_5_VLSimple):
+                 video_kwargs["nframes"] = self.max_num_frames
+             batched_messages = [chat_message.to_hf_messages(video_kwargs=video_kwargs) for chat_message in chat_messages]
+             texts = [self.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in batched_messages]
+-            image_inputs, video_inputs = process_vision_info(batched_messages)
++            if self.use_keyframe:
++                frame_idx = self.task_dict[task[0]][split[0]][doc_id[0]]['keyframe_indices']
++                assert len(frame_idx) == self.max_num_frames, f"Keyframe indices length {len(frame_idx)} does not match max_frames_num {self.max_num_frames}."
++                image_inputs, video_inputs = process_vision_info_keyframe(batched_messages, frame_idx=frame_idx)
++            else:
++                image_inputs, video_inputs = process_vision_info(batched_messages)
+             if video_inputs is not None:
+                 total_frames = video_inputs[0].shape[0]
+                 indices = np.linspace(0, total_frames - 1, self.max_num_frames, dtype=int)
+diff --git a/lmms_eval/models/simple/internvl2.py b/lmms_eval/models/simple/internvl2.py
+index 6dc0a598..f3bd2b53 100644
+--- a/lmms_eval/models/simple/internvl2.py
++++ b/lmms_eval/models/simple/internvl2.py
+@@ -10,7 +10,7 @@ from PIL import Image
+ from torchvision.transforms.functional import InterpolationMode
+ from tqdm import tqdm
+ from transformers import AutoModel, AutoTokenizer
+-
++from typing import List, Optional, Tuple, Union
+ from lmms_eval.api.instance import Instance
+ from lmms_eval.api.model import lmms
+ from lmms_eval.api.registry import register_model
+@@ -100,14 +100,17 @@ def get_index(bound, fps, max_frame, first_idx=0, num_segments=32):
+     return frame_indices
+ 
+ 
+-def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=32):
++def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=32, frame_idx=None):
+     vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
+     max_frame = len(vr) - 1
+     fps = float(vr.get_avg_fps())
+ 
+     pixel_values_list, num_patches_list = [], []
+     transform = build_transform(input_size=input_size)
+-    frame_indices = get_index(bound, fps, max_frame, first_idx=0, num_segments=num_segments)
++    if frame_idx is None:
++        frame_indices = get_index(bound, fps, max_frame, first_idx=0, num_segments=num_segments)
++    else:
++        frame_indices = np.array(frame_idx)
+     for frame_index in frame_indices:
+         img = Image.fromarray(vr[frame_index].asnumpy()).convert("RGB")
+         img = dynamic_preprocess(img, image_size=input_size, use_thumbnail=True, max_num=max_num)
+@@ -179,6 +182,7 @@ class InternVL2(lmms):
+         batch_size: str = "1",
+         num_frame: int = 32,
+         num_layers=None,
++        use_keyframe: Optional[bool] = False,
+         **kwargs,
+     ):
+         super().__init__()
+@@ -186,6 +190,8 @@ class InternVL2(lmms):
+         self.path = pretrained
+         self.num_frame = num_frame
+ 
++        self.use_keyframe = use_keyframe
++
+         batch_size = int(batch_size)
+         assert batch_size == 1, f"Batch size should be 1 for InternVL2, but got {batch_size}."
+         self.batch_size_per_gpu = batch_size
+@@ -315,9 +321,13 @@ class InternVL2(lmms):
+                     num_patches_list = None
+                 response, history = self.model.chat(self.tokenizer, pixel_values, contexts, gen_kwargs, num_patches_list=num_patches_list, history=None, return_history=True)
+             elif self.modality == "video":
++                frame_idx = None
++                if self.use_keyframe:
++                    frame_idx = self.task_dict[task][split][doc_id]['keyframe_indices']
++                    assert len(frame_idx) == self.num_frame, f"Keyframe indices length {len(frame_idx)} does not match max_frames_num {self.num_frame}."
+                 assert len(visuals) == 1, f"Only one video is supported, but got {len(visuals)} videos."
+                 video_path = visuals[0]
+-                pixel_values, num_patches_list = load_video(video_path, num_segments=self.num_frame)
++                pixel_values, num_patches_list = load_video(video_path, num_segments=self.num_frame, frame_idx=frame_idx)
+                 pixel_values = pixel_values.to(torch.bfloat16).cuda()
+                 video_prefix = "".join([f"Frame{i+1}: <image>\n" for i in range(len(num_patches_list))])
+                 question = video_prefix + contexts
+diff --git a/lmms_eval/models/simple/llava_onevision.py b/lmms_eval/models/simple/llava_onevision.py
+index e925b8a9..532ebf88 100644
+--- a/lmms_eval/models/simple/llava_onevision.py
++++ b/lmms_eval/models/simple/llava_onevision.py
+@@ -85,12 +85,15 @@ class Llava_OneVision(lmms):
+         mm_spatial_pool_mode: Optional[str] = "bilinear",
+         token_strategy: Optional[str] = "single",  # could be "single" or "multiple", "multiple" denotes adding multiple <image> tokens for each frame
+         video_decode_backend: str = "decord",
++        use_keyframe: bool = False,
+         **kwargs,
+     ) -> None:
+         super().__init__()
+         # Do not use kwargs for now
+         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+ 
++        self.use_keyframe = use_keyframe
++
+         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
+         accelerator = Accelerator(kwargs_handlers=[accelerator_kwargs])
+         if accelerator.num_processes > 1:
+@@ -382,6 +385,18 @@ class Llava_OneVision(lmms):
+         spare_frames = vr.get_batch(frame_idx).asnumpy()
+         return spare_frames  # (frames, height, width, channels)
+ 
++    def load_video_frame_idx(self, video_path, max_frames_num, frame_index):
++        if type(video_path) == str:
++            vr = VideoReader(video_path, ctx=cpu(0))
++        else:
++            vr = VideoReader(video_path[0], ctx=cpu(0))
++        total_frame_num = len(vr)
++        assert len(frame_index) == max_frames_num, f"Keyframe indices length {len(frame_index)} does not match max_frames_num {max_frames_num}."
++        frame_idx = sorted(frame_index)
++        frame_idx = [int(i) for i in frame_idx]
++        spare_frames = vr.get_batch(frame_idx).asnumpy()
++        return spare_frames  # (frames, height, width, channels)
++
+     def generate_until(self, requests: List[Instance]) -> List[str]:
+         res = []
+ 
+@@ -464,10 +479,14 @@ class Llava_OneVision(lmms):
+                     elif type(visual[0]) == str:  # For video task
+                         image_tensor = []
+                         try:
+-                            if self.video_decode_backend == "decord":
+-                                frames = self.load_video(visual, self.max_frames_num)
+-                            elif self.video_decode_backend == "pyav":
+-                                frames = read_video_pyav(visual[0], num_frm=self.max_frames_num)
++                            if self.use_keyframe:
++                                frame_index = self.task_dict[task][split][batched_doc_id[0]]['keyframe_indices']
++                                frames = self.load_video_frame_idx(visual, self.max_frames_num, frame_index)  
++                            else:
++                                if self.video_decode_backend == "decord":
++                                    frames = self.load_video(visual, self.max_frames_num)
++                                elif self.video_decode_backend == "pyav":
++                                    frames = read_video_pyav(visual[0], num_frm=self.max_frames_num)
+                             frames = self._image_processor.preprocess(frames, return_tensors="pt")["pixel_values"].half().cuda()
+                             image_tensor.append(frames)
+                         except Exception as e:
+diff --git a/lmms_eval/models/simple/llava_vid.py b/lmms_eval/models/simple/llava_vid.py
+index 5eddc5a0..e90119c8 100755
+--- a/lmms_eval/models/simple/llava_vid.py
++++ b/lmms_eval/models/simple/llava_vid.py
+@@ -107,6 +107,7 @@ class LlavaVid(lmms):
+         add_time_instruction: bool = False,
+         add_faster_video: bool = False,
+         faster_token_stride: int = 10,
++        use_keyframe: bool = False,
+         **kwargs,
+     ) -> None:
+         super().__init__()
+@@ -124,6 +125,7 @@ class LlavaVid(lmms):
+             self._device = torch.device(f"cuda:{accelerator.local_process_index}")
+             self.device_map = f"cuda:{accelerator.local_process_index}"
+ 
++        self.use_keyframe = use_keyframe
+         self.pretrained = pretrained
+         self.model_name = get_model_name_from_path(pretrained)
+         self.video_decode_backend = video_decode_backend
+@@ -401,6 +403,22 @@ class LlavaVid(lmms):
+                 new_list.append(j)
+         return new_list
+ 
++    def load_video_index(self, video_path, max_frames_num, fps, doc, force_sample=False):
++        if max_frames_num == 0:
++            return np.zeros((1, 336, 336, 3))
++        vr = VideoReader(video_path, ctx=cpu(0), num_threads=1)
++        total_frame_num = len(vr)
++        video_time = total_frame_num / vr.get_avg_fps()
++        fps = round(vr.get_avg_fps() / fps)
++        top_id = doc['keyframe_indices']
++        assert len(top_id) == max_frames_num, f"Keyframe indices length {len(top_id)} does not match max_frames_num {max_frames_num}."
++        frame_idx = sorted(top_id)
++        frame_time = [i / fps for i in frame_idx]
++        frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
++        spare_frames = vr.get_batch(frame_idx).asnumpy()
++        # import pdb;pdb.set_trace()
++        return spare_frames, frame_time, video_time
++
+     def generate_until(self, requests) -> List[str]:
+         res = []
+         pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
+@@ -424,7 +442,10 @@ class LlavaVid(lmms):
+                 # for visual in visuals:
+                 if len(visuals) == 1:
+                     if self.video_decode_backend == "decord":
+-                        video, frame_time, video_time = self.load_video(visuals[0], self.max_frames_num, self.fps, force_sample=self.force_sample)
++                        if self.use_keyframe:
++                            video, frame_time, video_time = self.load_video_index(visuals[0], self.max_frames_num, self.fps, self.task_dict[task][split][doc_id], force_sample=self.force_sample)
++                        else:
++                            video, frame_time, video_time = self.load_video(visuals[0], self.max_frames_num, self.fps, force_sample=self.force_sample)
+                     elif self.video_decode_backend == "pyav":
+                         video, frame_time, video_time = read_video_pyav(visuals[0], self.max_frames_num, self.fps, force_sample=self.force_sample)
+                     elif self.video_decode_backend == "image":
+@@ -445,8 +466,10 @@ class LlavaVid(lmms):
+                         frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
+                         # video = [visuals[i] for i in frame_idx]
+                         video = np.stack([np.array(Image.open(visuals[i])) for i in frame_idx], axis=0)
+-
+-                video = self._image_processor.preprocess(video, return_tensors="pt")["pixel_values"].cuda()
++                if isinstance(video, torch.Tensor):
++                    video = video.cuda()
++                else:
++                    video = self._image_processor.preprocess(video, return_tensors="pt")["pixel_values"].cuda()
+                 if self.torch_dtype == "bfloat16":
+                     video = video.bfloat16()
+                 else:
+diff --git a/lmms_eval/models/simple/qwen2_5_vl.py b/lmms_eval/models/simple/qwen2_5_vl.py
+index 1954f23c..20bee5f4 100644
+--- a/lmms_eval/models/simple/qwen2_5_vl.py
++++ b/lmms_eval/models/simple/qwen2_5_vl.py
+@@ -54,12 +54,15 @@ class Qwen2_5_VL(lmms):
+         system_prompt: Optional[str] = "You are a helpful assistant.",
+         interleave_visuals: Optional[bool] = False,
+         reasoning_prompt: Optional[str] = None,
++        use_keyframe: Optional[bool] = False,
+         **kwargs,
+     ) -> None:
+         super().__init__()
+         # Do not use kwargs for now
+         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+ 
++        self.use_keyframe = use_keyframe
++        
+         # Validate attention implementation
+         valid_attn_implementations = [None, "flash_attention_2", "sdpa", "eager"]
+         if attn_implementation not in valid_attn_implementations:
+diff --git a/lmms_eval/models/simple/qwen2_vl.py b/lmms_eval/models/simple/qwen2_vl.py
+index 635dea63..d3047fb9 100755
+--- a/lmms_eval/models/simple/qwen2_vl.py
++++ b/lmms_eval/models/simple/qwen2_vl.py
+@@ -21,6 +21,7 @@ from lmms_eval.models.model_utils.load_video import load_video_decord
+ 
+ try:
+     from qwen_vl_utils import process_vision_info
++    from ..model_utils.qwen2_5_vl_keyframe_vision_process import process_vision_info_keyframe
+ except ImportError:
+     eval_logger.warning("Failed to import qwen_vl_utils; Please install it via `pip install qwen-vl-utils`")
+ 
+@@ -47,12 +48,15 @@ class Qwen2_VL(lmms):
+         system_prompt: Optional[str] = "You are a helpful assistant.",
+         interleave_visuals: Optional[bool] = False,
+         reasoning_prompt: Optional[str] = None,
++        use_keyframe: Optional[bool] = False,
+         **kwargs,
+     ) -> None:
+         super().__init__()
+         # Do not use kwargs for now
+         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+ 
++        self.use_keyframe = use_keyframe
++
+         accelerator = Accelerator()
+         if accelerator.num_processes > 1:
+             self._device = torch.device(f"cuda:{accelerator.local_process_index}")
+@@ -259,7 +263,7 @@ class Qwen2_VL(lmms):
+                                 first_frame = vr[0].asnumpy()
+                                 height, width = first_frame.shape[:2]
+                                 # max_pixels = height * width # This seems incorrect, should use instance config
+-                                processed_visuals.append({"type": "video", "video": visual, "max_pixels": self.max_pixels, "min_pixels": self.min_pixels})
++                                processed_visuals.append({"type": "video", "video": visual, "max_pixels": self.max_pixels, "min_pixels": self.min_pixels, "nframes": self.max_num_frames})
+                             else:
+                                 eval_logger.warning(f"Skipping empty video: {visual}")
+                         except Exception as e:
+@@ -322,7 +326,12 @@ class Qwen2_VL(lmms):
+ 
+             texts = [self.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in batched_messages]
+             # TODO: Consider moving video frame sampling logic into process_vision_info or a helper.
+-            image_inputs, video_inputs = process_vision_info(batched_messages)
++            if self.use_keyframe:
++                frame_idx = self.task_dict[task][split][doc_id[0]]['keyframe_indices']
++                assert len(frame_idx) == self.max_num_frames, f"Keyframe indices length {len(frame_idx)} does not match max_frames_num {self.max_num_frames}."
++                image_inputs, video_inputs = process_vision_info_keyframe(batched_messages, frame_idx=frame_idx)
++            else:
++                image_inputs, video_inputs = process_vision_info(batched_messages)
+             if video_inputs is not None and len(video_inputs) > 0 and video_inputs[0] is not None:
+                 # Assuming video_inputs is a list where the first element holds the tensor
+                 video_tensor = video_inputs[0]
+diff --git a/lmms_eval/tasks/__init__.py b/lmms_eval/tasks/__init__.py
+index e8f367ca..dfd1dacc 100755
+--- a/lmms_eval/tasks/__init__.py
++++ b/lmms_eval/tasks/__init__.py
+@@ -12,7 +12,7 @@ from lmms_eval import utils
+ from lmms_eval.api.group import ConfigurableGroup, GroupConfig
+ from lmms_eval.api.task import ConfigurableMessagesTask, ConfigurableTask, Task
+ from lmms_eval.evaluator_utils import get_subtask_list
+-
++import json
+ GROUP_ONLY_KEYS = list(GroupConfig().to_dict().keys())
+ 
+ 
+@@ -28,11 +28,15 @@ class TaskManager:
+         include_path: Optional[Union[str, List]] = None,
+         include_defaults: bool = True,
+         model_name: Optional[str] = None,
++        data_files: Optional[List[str]] = None,
+     ) -> None:
+         self.verbosity = verbosity
+         self.include_path = include_path
+         self.logger = eval_logger
+         self.model_name = model_name
++        if isinstance(data_files, str):
++            data_files = json.loads(data_files)
++        self.data_files = data_files
+ 
+         self._task_index = self.initialize_tasks(include_path=include_path, include_defaults=include_defaults)
+         self._all_tasks = sorted(list(self._task_index.keys()))
+@@ -294,6 +298,8 @@ class TaskManager:
+                 name_or_config = {"task": name_or_config, **update_config}
+             elif self._name_is_task(name_or_config) or self._name_is_python_task(name_or_config):
+                 task_config = self._get_config(name_or_config)
++                if self.data_files is not None and task_config["dataset_kwargs"].get("data_files") is not None:
++                    task_config["dataset_kwargs"]["data_files"] = self.data_files
+                 return _load_task(task_config, task=name_or_config)
+             else:
+                 subtask_list = self._get_tasklist(name_or_config)
+diff --git a/lmms_eval/tasks/longvideobench/longvideobench_val_v.yaml b/lmms_eval/tasks/longvideobench/longvideobench_val_v.yaml
+index cf1c00b9..3891ab0e 100644
+--- a/lmms_eval/tasks/longvideobench/longvideobench_val_v.yaml
++++ b/lmms_eval/tasks/longvideobench/longvideobench_val_v.yaml
+@@ -1,11 +1,18 @@
+-dataset_path: longvideobench/LongVideoBench
++# dataset_path: longvideobench/LongVideoBench
++# dataset_kwargs:
++#   token: True
++#   cache_dir: longvideobench
++#   video: True
++#   force_download: False
++#   local_files_only: False
++#   # From_YouTube: True
++dataset_path: ./datasets/longvideobench
+ dataset_kwargs:
+-  token: True
++  custom_load: True
++  data_files: {"validation" : lvb_val.json}
++  token: False
+   cache_dir: longvideobench
+-  video: True
+-  force_download: False
+-  local_files_only: False
+-  # From_YouTube: True
++  video: False
+ task: longvideobench_val_v
+ test_split: validation
+ doc_to_visual: !function utils.longvideobench_doc_to_visual_v
+diff --git a/lmms_eval/tasks/longvideobench/utils.py b/lmms_eval/tasks/longvideobench/utils.py
+index de79fbec..359a2527 100644
+--- a/lmms_eval/tasks/longvideobench/utils.py
++++ b/lmms_eval/tasks/longvideobench/utils.py
+@@ -112,13 +112,13 @@ def insert_subtitles_into_frames(frame_timestamps, subtitles, starting_timestamp
+ 
+ 
+ def longvideobench_doc_to_text(doc, lmms_eval_specific_kwargs):
+-    candidates = []
+-
+-    for i in range(5):
+-        candidate = doc.get(f"option{i}")
+-        if candidate != "N/A":
+-            candidates.append(candidate)
++    # candidates = []
+ 
++    # for i in range(5):
++    #     candidate = doc.get(f"option{i}")
++    #     if candidate != "N/A":
++    #         candidates.append(candidate)
++    candidates = doc['candidates']
+     question = doc["question"] + "\n" + "\n".join([". ".join([chr(ord("A") + i), candidate]) for i, candidate in enumerate(candidates)])
+     pre_prompt = lmms_eval_specific_kwargs["pre_prompt"]
+     post_prompt = lmms_eval_specific_kwargs["post_prompt"]
+@@ -147,8 +147,8 @@ def longvideobench_doc_to_text(doc, lmms_eval_specific_kwargs):
+ 
+ 
+ hf_home = os.getenv("HF_HOME", "~/.cache/huggingface/")
+-base_cache_dir = os.path.expanduser(hf_home)
+-
++# base_cache_dir = os.path.expanduser(hf_home)
++base_cache_dir = './datasets/'
+ 
+ def longvideobench_doc_to_visual_v(doc):
+     with open(Path(__file__).parent / "longvideobench_val_v.yaml", "r") as f:
+@@ -202,31 +202,69 @@ def get_multi_choice_info(options):
+ 
+ def parse_multi_choice_response(response, all_choices, index2ans):
+     """
+-    Changed from MMMU-style complex parsing into simple parsing.
+-    Fixed to avoid 'D. A book' be parsed as A.
+-    Same as original LongVideoBench paper (from author Haoning Wu), if parsing failed, it will assign a random choice to model.
++    Parse the prediction from the generated response.
++    Return the predicted index e.g., A, B, C, D.
++    https://github.com/MMMU-Benchmark/MMMU/blob/51ce7f3e829c16bb44bc5445782686b4c3508794/eval/eval_utils.py#L10
+     """
+-    s = response.strip()
+-    answer_prefixes = [
+-        "The best answer is",
+-        "The correct answer is",
+-        "The answer is",
+-        "The answer",
+-        "The best option is",
+-        "The correct option is",
+-        "Best answer:",
+-        "Best option:",
+-    ]
+-    for answer_prefix in answer_prefixes:
+-        s = s.replace(answer_prefix, "")
+-
+-    if len(s.split()) > 10 and not re.search("[ABCDE]", s):
+-        return random.choice(all_choices)
+-
+-    matches = re.search(r"[ABCDE]", s)
+-    if matches is None:
+-        return random.choice(all_choices)
+-    return matches[0]
++    for char in [",", ".", "!", "?", ";", ":", "'"]:
++        response = response.strip(char)
++    response = " " + response + " "  # add space to avoid partial match
++
++    index_ans = True
++    ans_with_brack = False
++    candidates = []
++
++    # if response:
++    #     candidates.append(random.choice(all_choices))
++
++    for choice in all_choices:  # e.g., (A) (B) (C) (D)
++        if f"({choice})" in response:
++            candidates.append(choice)
++            ans_with_brack = True
++
++    if len(candidates) == 0:
++        for choice in all_choices:  # e.g., A B C D
++            if f"{choice} " in response:
++                candidates.append(choice)
++
++    if len(candidates) == 0:
++        for choice in all_choices:  # e.g., A. B. C. D.
++            if f"{choice}." in response:
++                candidates.append(choice)
++
++    # if all above doesn't get candidates, check if the content is larger than 5 tokens and try to parse the example
++    # if len(candidates) == 0 and len(response.split()) > 5:
++    #     for index, ans in index2ans.items():
++    #         # print('response:  ', response)
++    #         if ans.lower() in response.lower():
++    #             candidates.append(index)
++    #             index_ans = False  # it's content ans.
++
++    if len(candidates) == 0:  # still not get answer, randomly choose one.
++        pred_index = random.choice(all_choices)
++    elif len(candidates) > 1:
++        start_indexes = []
++        if index_ans:
++            if ans_with_brack:
++                for can in candidates:
++                    index = response.rfind(f"({can})")
++                    start_indexes.append(index)  # -1 will be ignored anyway
++                # start_indexes = [generated_response.index(f'({can})') for can in candidates]
++            else:
++                for can in candidates:
++                    index = response.rfind(f" {can} ")
++                    start_indexes.append(index)
++        else:
++            for can in candidates:
++                index = response.lower().rfind(index2ans[can].lower())
++                start_indexes.append(index)
++        # get the last one
++        pred_index = candidates[np.argmax(start_indexes)]
++    else:  # if only one candidate, use it.
++        pred_index = candidates[0]
++
++    return pred_index
++
+ 
+ 
+ def evaluate_longvideobench(samples):
+@@ -288,7 +326,7 @@ def longvideobench_process_results(doc, results):
+         all_choices.append(chr(ord("A") + i))
+ 
+     parsed_pred = parse_multi_choice_response(pred, all_choices, index2ans)
+-    id = doc["id"]
++    id = doc["video_id"]
+     lvb_acc = {"id": id, "duration_group": doc["duration_group"], "question_category": doc["question_category"], "answer": chr(ord("A") + doc["correct_choice"]), "parsed_pred": parsed_pred}
+     return {
+         "lvb_acc": lvb_acc,
+diff --git a/lmms_eval/tasks/mlvu/mlvu_dev.yaml b/lmms_eval/tasks/mlvu/mlvu_dev.yaml
+index e4a08b23..9513d9e9 100644
+--- a/lmms_eval/tasks/mlvu/mlvu_dev.yaml
++++ b/lmms_eval/tasks/mlvu/mlvu_dev.yaml
+@@ -1,8 +1,15 @@
+-dataset_path: sy1998/MLVU_dev
++# dataset_path: sy1998/MLVU_dev
++# dataset_kwargs:
++#   token: True
++#   cache_dir: mlvu
++#   video: True
++dataset_path: ./datasets/mlvu
+ dataset_kwargs:
+-  token: True
++  custom_load: True
++  token: False
+   cache_dir: mlvu
+-  video: True
++  data_files: {"test" : mlvu_dev.json}
++  video: False
+ generation_kwargs:
+   max_new_tokens: 16
+   temperature: 0
+diff --git a/lmms_eval/tasks/mlvu/utils.py b/lmms_eval/tasks/mlvu/utils.py
+index 2b91a457..d3cf0397 100644
+--- a/lmms_eval/tasks/mlvu/utils.py
++++ b/lmms_eval/tasks/mlvu/utils.py
+@@ -16,7 +16,8 @@ from lmms_eval.tasks._task_utils.file_utils import generate_submission_file
+ 
+ hf_home = os.getenv("HF_HOME", "./~/.cache/huggingface")
+ # hf_home="/share/junjie/shuyan/lmms-eval/~/.cache/huggingface"
+-base_cache_dir = os.path.expanduser(hf_home)
++# base_cache_dir = os.path.expanduser(hf_home)
++base_cache_dir = './datasets/'
+ 
+ 
+ with open(Path(__file__).parent / "mlvu_dev.yaml", "r") as f:
+@@ -43,7 +44,7 @@ cache_dir_test = os.path.join(base_cache_dir, cache_name_test)
+ 
+ def mlvu_doc_to_visual_dev(doc):
+     video_path = doc["video_name"]
+-    video_path = os.path.join(cache_dir_dev, video_path)
++    video_path = os.path.join(cache_dir_dev, 'video', video_path)
+     if os.path.exists(video_path):
+         video_path = video_path
+     else:
+diff --git a/lmms_eval/tasks/videomme/utils.py b/lmms_eval/tasks/videomme/utils.py
+index 46a98e4a..1c18c918 100644
+--- a/lmms_eval/tasks/videomme/utils.py
++++ b/lmms_eval/tasks/videomme/utils.py
+@@ -82,7 +82,8 @@ replace_prompt = " Please answer yes or no."
+ hf_home = os.getenv("HF_HOME", "~/.cache/huggingface/")
+ # cache_dir = os.path.join(hf_home, cache_dir)
+ # base_cache_dir = config["dataset_kwargs"]["cache_dir"]
+-base_cache_dir = os.path.expanduser(hf_home)
++# base_cache_dir = os.path.expanduser(hf_home)
++base_cache_dir = './datasets/'
+ with open(Path(__file__).parent / "videomme.yaml", "r") as f:
+     raw_data = f.readlines()
+     safe_data = []
+@@ -157,7 +158,8 @@ def videomme_doc_to_visual(doc):
+ 
+ 
+ def videomme_doc_to_text(doc, lmms_eval_specific_kwargs=None):
+-    option_prompt = "Select the best answer to the following multiple-choice question based on the video and the subtitles. Respond with only the letter (A, B, C, or D) of the correct option."
++    # option_prompt = "Select the best answer to the following multiple-choice question based on the video and the subtitles. Respond with only the letter (A, B, C, or D) of the correct option."
++    option_prompt = "Select the best answer to the following multiple-choice question based on the video. Respond with only the letter (A, B, C, or D) of the correct option."
+     question = doc["question"]
+     option = "\n".join([f"{opt}" for i, opt in enumerate(doc["options"])])
+     question = question + "\n" + option
+@@ -184,7 +186,7 @@ def videomme_doc_to_text_subtitle(doc, lmms_eval_specific_kwargs=None):
+     video_path = doc["videoID"] + ".mp4"
+     video_path = os.path.join(cache_dir, "data", video_path)
+     subtitle_path = os.path.join(cache_dir, "subtitle", doc["videoID"] + ".srt")
+-    video_path = os.path.join(cache_dir, video_path)
++    # video_path = os.path.join(cache_dir, video_path)
+     if os.path.exists(subtitle_path):  # Denote have subtitle
+         subtitle = open(subtitle_path).readlines()
+     else:
+diff --git a/lmms_eval/tasks/videomme/videomme.yaml b/lmms_eval/tasks/videomme/videomme.yaml
+index 93a74300..f8ee35a7 100644
+--- a/lmms_eval/tasks/videomme/videomme.yaml
++++ b/lmms_eval/tasks/videomme/videomme.yaml
+@@ -1,9 +1,16 @@
+-dataset_path: lmms-lab/Video-MME
++# dataset_path: lmms-lab/Video-MME
++dataset_path: ./datasets/videomme/
++# dataset_kwargs:
++#   token: True
++#   cache_dir: videomme
++#   video: True
++  # From_YouTube: True
+ dataset_kwargs:
+-  token: True
++  custom_load: True
++  data_files: {"test" : videomme_json_file.json}
++  token: False
+   cache_dir: videomme
+-  video: True
+-  # From_YouTube: True
++  video: False
+ task: videomme
+ test_split: test
+ output_type: generate_until
+@@ -27,20 +34,20 @@ lmms_eval_specific_kwargs:
+   default:
+     pre_prompt: ""
+     post_prompt: "\nAnswer with the option's letter from the given choices directly."
+-  gpt4v:
+-    pre_prompt: ""
+-    post_prompt: "Answer the question with A, B, C, or D."
+-  llava_vid:
+-    pre_prompt: ""
+-    post_prompt: "The best answer is:"
++  # gpt4v:
++  #   pre_prompt: ""
++  #   post_prompt: "Answer the question with A, B, C, or D."
++  # llava_vid:
++  #   pre_prompt: ""
++  #   post_prompt: "The best answer is:"
+   # qwen_vl:  
+   #   pre_prompt: ""
+   #   post_prompt: " Answer:"
+   # otterhd:
+   #   pre_prompt: ""
+   #   post_prompt: " Answer:"
+-  xcomposer2_4khd:
+-    pre_prompt: "[UNUSED_TOKEN_146]user\n"
+-    post_prompt: " Answer this question with A, B, C, or D.[UNUSED_TOKEN_145]\n[UNUSED_TOKEN_146]assistant\n"
++  # xcomposer2_4khd:
++  #   pre_prompt: "[UNUSED_TOKEN_146]user\n"
++  #   post_prompt: " Answer this question with A, B, C, or D.[UNUSED_TOKEN_145]\n[UNUSED_TOKEN_146]assistant\n"
+ metadata:
+   - version: 0.0
+diff --git a/lmms_eval/tasks/videomme/videomme_w_subtitle.yaml b/lmms_eval/tasks/videomme/videomme_w_subtitle.yaml
+index a59c058c..85bb5e79 100644
+--- a/lmms_eval/tasks/videomme/videomme_w_subtitle.yaml
++++ b/lmms_eval/tasks/videomme/videomme_w_subtitle.yaml
+@@ -1,9 +1,16 @@
+-dataset_path: lmms-lab/Video-MME
++# dataset_path: lmms-lab/Video-MME
++dataset_path: ./datasets/videomme/
++# dataset_kwargs:
++#   token: True
++#   cache_dir: videomme
++#   video: True
++#   # From_YouTube: True
+ dataset_kwargs:
+-  token: True
++  custom_load: True
++  data_files: {"test" : videomme_json_file.json}
++  token: False
+   cache_dir: videomme
+-  video: True
+-  # From_YouTube: True
++  video: False
+ task: videomme_w_subtitle
+ test_split: test
+ output_type: generate_until
+@@ -25,15 +32,15 @@ metric_list:
+     higher_is_better: true
+ lmms_eval_specific_kwargs:
+   default:
+-    frame_num: 32
+-    pre_prompt: ""
+-    post_prompt: "\nAnswer the question using a single word or phrase."
+-  gemini_api:
+-    gemini_api_flag: "full subtitle"
+-  llava_vid:
+-    frame_num: 768
++    frame_num: 64
+     pre_prompt: ""
+     post_prompt: "\nAnswer the question using a single word or phrase."
++  # gemini_api:
++  #   gemini_api_flag: "full subtitle"
++  # llava_vid:
++  #   frame_num: 768
++  #   pre_prompt: ""
++  #   post_prompt: "\nAnswer the question using a single word or phrase."
+   # gpt4v:
+   #   pre_prompt: ""
+   #   post_prompt: 
+diff --git a/lmms_eval/models/model_utils/qwen2_5_vl_keyframe_vision_process.py b/lmms_eval/models/model_utils/qwen2_5_vl_keyframe_vision_process.py
+new file mode 100644
+index 00000000..d2ba1ae0
+--- /dev/null
++++ b/lmms_eval/models/model_utils/qwen2_5_vl_keyframe_vision_process.py
+@@ -0,0 +1,177 @@
++import base64
++import copy
++import logging
++import math
++import os
++import sys
++import time
++import warnings
++from functools import lru_cache
++from io import BytesIO
++from typing import Optional, Union, Tuple, List, Any, Dict
++from concurrent.futures import ThreadPoolExecutor
++
++import requests
++import torch
++import torchvision
++from packaging import version
++from PIL import Image
++import numpy as np
++from torchvision import io, transforms
++from torchvision.transforms import InterpolationMode
++
++from qwen_vl_utils.vision_process import *
++
++MAX_RATIO = 200
++SPATIAL_MERGE_SIZE = 2
++IMAGE_MIN_TOKEN_NUM = 4
++IMAGE_MAX_TOKEN_NUM = 16384
++VIDEO_MIN_TOKEN_NUM = 128
++VIDEO_MAX_TOKEN_NUM = 768
++
++FPS = 2.0
++FRAME_FACTOR = 2
++FPS_MIN_FRAMES = 4
++FPS_MAX_FRAMES = 768
++MAX_NUM_WORKERS_FETCH_VIDEO = 8
++
++MODEL_SEQ_LEN = int(float(os.environ.get('MODEL_SEQ_LEN', 128000)))
++logger = logging.getLogger(__name__)
++
++
++def _read_video_decord_keyframe(
++    ele: Dict[str, Any],frame_idx=None,
++) -> Tuple[torch.Tensor, float]:
++    import decord
++    video_path = ele["video"]
++    st = time.time()
++    vr = decord.VideoReader(video_path)
++    total_frames, video_fps = len(vr), vr.get_avg_fps()
++
++    nframes = len(frame_idx)
++    idx = frame_idx
++    video = vr.get_batch(idx).asnumpy()
++    video = torch.tensor(video).permute(0, 3, 1, 2)  # Convert to TCHW format
++    logger.info(f"decord:  {video_path=}, {total_frames=}, {video_fps=}, time={time.time() - st:.3f}s")
++    sample_fps = nframes / max(total_frames, 1e-6) * video_fps
++
++    video_metadata = dict(
++        fps=video_fps,
++        frames_indices=idx,
++        total_num_frames=total_frames,
++        video_backend="decord",
++    )
++    return video, video_metadata, sample_fps
++
++
++FORCE_QWENVL_VIDEO_READER = os.getenv("FORCE_QWENVL_VIDEO_READER", None)
++
++def fetch_video_keyframe(ele: Dict[str, Any], image_patch_size: int = 14, return_video_sample_fps: bool = False,
++                return_video_metadata: bool = False, frame_idx=None) -> Union[torch.Tensor, List[Image.Image]]:
++    image_factor = image_patch_size * SPATIAL_MERGE_SIZE
++    VIDEO_FRAME_MIN_PIXELS = VIDEO_MIN_TOKEN_NUM * image_factor * image_factor
++    VIDEO_FRAME_MAX_PIXELS = VIDEO_MAX_TOKEN_NUM * image_factor * image_factor
++    if isinstance(ele["video"], str):
++        video, video_metadata, sample_fps = _read_video_decord_keyframe(ele,frame_idx=frame_idx)
++    else:
++        # The input is a list of frames
++        assert isinstance(ele["video"], (list, tuple))
++        process_info = ele.copy()
++        process_info.pop("type", None)
++        process_info.pop("video", None)
++        # use ThreadPoolExecutor to parallel process frames
++        max_workers = min(MAX_NUM_WORKERS_FETCH_VIDEO, len(ele["video"]))
++        with ThreadPoolExecutor(max_workers=max_workers) as executor:
++            futures = [
++                executor.submit(fetch_image, {"image": video_element, **process_info}, image_factor)
++                for video_element in ele["video"]
++            ]
++            image_list = [future.result() for future in futures]
++
++        nframes = ceil_by_factor(len(image_list), FRAME_FACTOR)
++        if len(image_list) < nframes:
++            image_list.extend([image_list[-1]] * (nframes - len(image_list)))
++
++        sample_fps = ele.get("sample_fps", 2.0)
++        video = torch.stack([
++            torch.from_numpy(np.array(image).transpose(2, 0, 1))
++            for image in image_list
++        ])
++
++        # fake video metadata
++        raw_fps = process_info.pop("raw_fps", sample_fps)
++        video_metadata = dict(
++            fps=raw_fps,
++            frames_indices=[i for i in range(len(video))],
++            total_num_frames=(nframes / sample_fps) * raw_fps,
++        )
++
++    nframes, _, height, width = video.shape
++    min_pixels = ele.get("min_pixels", VIDEO_FRAME_MIN_PIXELS)
++    total_pixels = ele.get("total_pixels", MODEL_SEQ_LEN * image_factor * image_factor * 0.9)
++    max_pixels = max(min(VIDEO_FRAME_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR), int(min_pixels * 1.05))
++    max_pixels_supposed = ele.get("max_pixels", max_pixels)
++    if max_pixels_supposed > max_pixels:
++        logger.warning(f"The given max_pixels[{max_pixels_supposed}] exceeds limit[{max_pixels}].")
++    max_pixels = min(max_pixels_supposed, max_pixels)
++    if "resized_height" in ele and "resized_width" in ele:
++        resized_height, resized_width = smart_resize(
++            ele["resized_height"],
++            ele["resized_width"],
++            factor=image_factor,
++        )
++    else:
++        resized_height, resized_width = smart_resize(
++            height,
++            width,
++            factor=image_factor,
++            min_pixels=min_pixels,
++            max_pixels=max_pixels,
++        )
++    video = transforms.functional.resize(
++        video,
++        [resized_height, resized_width],
++        interpolation=InterpolationMode.BICUBIC,
++        antialias=True,
++    ).float()
++
++    final_video = (video, video_metadata) if return_video_metadata else video
++    if return_video_sample_fps:
++        return final_video, sample_fps
++    return final_video
++
++def process_vision_info_keyframe(
++    conversations: Union[List[Dict[str, Any]], List[List[Dict[str, Any]]]],
++    return_video_kwargs: bool = False,
++    return_video_metadata: bool = False,
++    image_patch_size: int = 14,
++    frame_idx = None,
++) -> Tuple[Optional[List[Image.Image]], Optional[List[Union[torch.Tensor, List[Image.Image]]]], Optional[Dict[str, Any]]]:
++
++    vision_infos = extract_vision_info(conversations)
++    ## Read images or videos
++    image_inputs = []
++    video_inputs = []
++    video_sample_fps_list = []
++    for vision_info in vision_infos:
++        if "image" in vision_info or "image_url" in vision_info:
++            image_inputs.append(fetch_image(vision_info, image_patch_size=image_patch_size))
++        elif "video" in vision_info:
++            video_input, video_sample_fps = fetch_video_keyframe(vision_info, return_video_sample_fps=True,
++                        image_patch_size=image_patch_size, return_video_metadata=return_video_metadata,frame_idx=frame_idx)
++            video_sample_fps_list.append(video_sample_fps)
++            video_inputs.append(video_input)
++        else:
++            raise ValueError("image, image_url or video should in content.")
++    if len(image_inputs) == 0:
++        image_inputs = None
++    if len(video_inputs) == 0:
++        video_inputs = None
++
++    video_kwargs = {'do_sample_frames': False}
++    if not return_video_metadata: # BC for qwen2.5vl
++        video_kwargs.update({'fps': video_sample_fps_list})
++
++    if return_video_kwargs:
++        return image_inputs, video_inputs, video_kwargs
++    return image_inputs, video_inputs
+\ No newline at end of file

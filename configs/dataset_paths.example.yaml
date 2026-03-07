@@ -1,0 +1,32 @@
+# Edit this file for your local environment.
+# All paths can be absolute or relative to the repo root.
+
+videomme:
+  dataset_root: datasets/videomme
+  questions_file: datasets/videomme/videomme_json_file.json
+  video_dir: data
+  feature_dirs:
+    blip2: datasets/videomme/blip2_features_and_scores
+    blip1: datasets/videomme/blip1_features_and_scores
+    clip: datasets/videomme/clip_features_and_scores
+    siglip: datasets/videomme/siglip_features_and_scores
+
+lvb:
+  dataset_root: datasets/longvideobench
+  questions_file: datasets/longvideobench/lvb_val.json
+  video_dir: videos
+  feature_dirs:
+    blip2: datasets/longvideobench/blip2_features_and_scores
+    blip1: datasets/longvideobench/blip1_features_and_scores
+    clip: datasets/longvideobench/clip_features_and_scores
+    siglip: datasets/longvideobench/siglip_features_and_scores
+
+mlvu:
+  dataset_root: datasets/mlvu
+  questions_file: datasets/mlvu/mlvu_dev.json
+  video_dir: video
+  feature_dirs:
+    blip2: datasets/mlvu/blip2_features_and_scores
+    blip1: datasets/mlvu/blip1_features_and_scores
+    clip: datasets/mlvu/clip_features_and_scores
+    siglip: datasets/mlvu/siglip_features_and_scores

@@ -1,0 +1,49 @@
+# Default WFS hyper-parameters per benchmark.
+
+videomme:
+  max_frames: 16
+  wavelet: db4
+  drift_level: 3
+  height_factor: 0.5
+  prominence_factor: 0.05
+  min_distance_ratio: 0.02
+  min_distance_absolute: 5
+  w_duration: 0.4
+  w_mean: 0.2
+  w_max: 0.3
+  w_var: 0.1
+  strictness_factor: 1.2
+  temperature: 1.0
+  lambda_param: 0.5
+
+lvb:
+  max_frames: 16
+  wavelet: db4
+  drift_level: 3
+  height_factor: 0.5
+  prominence_factor: 0.05
+  min_distance_ratio: 0.02
+  min_distance_absolute: 5
+  w_duration: 0.4
+  w_mean: 0.2
+  w_max: 0.3
+  w_var: 0.1
+  strictness_factor: 1.2
+  temperature: 1.0
+  lambda_param: 0.5
+
+mlvu:
+  max_frames: 16
+  wavelet: db4
+  drift_level: 3
+  height_factor: 0.5
+  prominence_factor: 0.05
+  min_distance_ratio: 0.02
+  min_distance_absolute: 5
+  w_duration: 0.4
+  w_mean: 0.2
+  w_max: 0.3
+  w_var: 0.1
+  strictness_factor: 1.2
+  temperature: 1.0
+  lambda_param: 0.5

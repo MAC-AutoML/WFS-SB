@@ -1,0 +1,8 @@
+pywavelets
+decord==0.6.0
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+decord==0.6.0
+qwen_vl_utils==0.0.14
+transformers==4.49.0
